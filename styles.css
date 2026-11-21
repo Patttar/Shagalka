@@ -109,6 +109,10 @@ a { color: inherit; text-decoration: none; }
 #ui > .topbar > *, #ui > .map-ctrls > * { pointer-events: auto; }
 #ui.full { background: var(--surface-page); overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .leaflet-control-attribution { font-size: 10px; }
+/* Dark theme → dark map: invert the tiles only; route line and markers keep their colours. */
+.map-dark .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.92) saturate(0.6); }
+.map-dark .leaflet-control-attribution { background: rgba(23, 23, 23, 0.8); color: var(--fg-muted); }
+.map-dark .leaflet-control-attribution a { color: var(--info-text); }
 
 .topbar {
   display: flex; align-items: center; justify-content: space-between; gap: var(--s-3);
@@ -210,6 +214,12 @@ a { color: inherit; text-decoration: none; }
 .route-card > * { position: relative; }
 .route-card .t { font-size: 16px; font-weight: 600; line-height: 1.25; }
 .route-card .m { font-size: 12px; opacity: 0.88; }
+/* No photo for the place yet: tinted card with a pin, so the title stays readable. */
+.route-card.noimg { background: var(--brand-a10); color: var(--fg-primary); }
+.route-card.noimg::before { display: none; }
+.route-card.noimg .m { opacity: 1; color: var(--fg-muted); }
+.noimg-ic { position: absolute !important; top: var(--s-3); left: var(--s-3); color: var(--info-text); }
+.thumb-ph { width: 64px; height: 64px; border-radius: var(--r-md); flex: none; display: grid; place-items: center; background: var(--brand-a10); color: var(--info-text); }
 .fav-badge { position: absolute !important; top: var(--s-2); right: var(--s-2); width: 32px; height: 32px; display: grid; place-items: center; border-radius: 999px; background: var(--surface-card); color: var(--brand); }
 .skeleton { background: var(--surface-subtle); position: relative; overflow: hidden; }
 .skeleton::after { content: ""; position: absolute; inset: 0; transform: translateX(-100%); background: linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent); animation: shimmer 1.2s infinite; }
@@ -227,6 +237,7 @@ a { color: inherit; text-decoration: none; }
 .gallery::-webkit-scrollbar { display: none; }
 .gallery figure { margin: 0; flex: none; width: 144px; scroll-snap-align: start; }
 .gallery img { width: 144px; height: 96px; object-fit: cover; border-radius: var(--r-md); display: block; background: var(--surface-moderate); }
+.gallery .ph { width: 144px; height: 96px; border-radius: var(--r-md); display: grid; place-items: center; background: var(--brand-a10); color: var(--info-text); }
 .gallery figcaption { margin-top: 6px; font-size: 12px; color: var(--fg-secondary); line-height: 1.35; }
 
 /* ---------- shape options ---------- */

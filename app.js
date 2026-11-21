@@ -1,4 +1,5 @@
 import { icon } from './icons.js';
+import { buildRoutes as buildRealRoutes, placePhoto, dist, pathLen } from './routing.js';
 
 /* ============================================================
    Шагалка — clickable prototype. Static, no build step.
@@ -32,7 +33,6 @@ const PLACES = [
   { id: 'khamovniki', name: 'Хамовнический парк', img: 'img/khamovniki.jpg' },
   { id: 'muzeon', name: 'Музеон', img: 'img/muzeon.jpg' },
 ];
-const placeById = id => PLACES.find(p => p.id === id) || PLACES[0];
 
 const TIME_PRESETS = [30, 60, 90, 120];
 const STEP_PRESETS = [3000, 5000, 8000, 10000];
@@ -44,10 +44,11 @@ const state = {
   history: store.get('history', []),
   profile: store.get('profile', { weight: '', stepCm: 75 }),
   me: null,
+  address: '',
   geo: 'pending', // pending | ok | denied | unavailable
   demo: false,
   routes: [],
-  loadingUntil: 0,
+  routesStatus: 'idle', // idle | loading | ready | error
   walk: null,
   lastWalk: null,
   draft: null,
@@ -67,6 +68,8 @@ function fmtGoalTime(min) {
   return `${h} ч ${m} мин`;
 }
 const fmtDur = min => (min < 60 ? `${Math.round(min)} мин` : `${Math.floor(min / 60)} ч ${String(Math.round(min % 60)).padStart(2, '0')} мин`);
+/** Fits a narrow three-column tile: "63 мин" up to 99 minutes, then "1 ч 40 м". */
+const fmtDurShort = min => { const m = Math.round(min); return m < 100 ? `${m} мин` : `${Math.floor(m / 60)} ч ${String(m % 60).padStart(2, '0')} м`; };
 const fmtClock = ms => { const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60; return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(ss).padStart(2, '0'); };
 const fmtDate = iso => { const d = new Date(iso), now = new Date(); const t = d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }); const day = new Date(now.getFullYear(), now.getMonth(), now.getDate()); const dd = new Date(d.getFullYear(), d.getMonth(), d.getDate()); const diff = (day - dd) / 864e5; if (diff === 0) return 'Сегодня, ' + t; if (diff === 1) return 'Вчера, ' + t; return d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' }); };
 
@@ -82,52 +85,91 @@ const goalChip = (s = state.settings) => (s.goal === 'time' ? fmtGoalTime(s.time
 const shapeChip = (s = state.settings) => (s.shape === 'loop' ? 'Замкнутый' : 'В одну сторону');
 
 /* ---------------- geometry ---------------- */
-const R = 6371000;
-function offset([lat, lng], dx, dy) { return [lat + (dy / R) * (180 / Math.PI), lng + ((dx / R) * (180 / Math.PI)) / Math.cos((lat * Math.PI) / 180)]; }
-function dist(a, b) { const toR = x => (x * Math.PI) / 180; const dLat = toR(b[0] - a[0]), dLng = toR(b[1] - a[1]); const h = Math.sin(dLat / 2) ** 2 + Math.cos(toR(a[0])) * Math.cos(toR(b[0])) * Math.sin(dLng / 2) ** 2; return 2 * R * Math.asin(Math.sqrt(h)); }
-function pathLen(pts) { let s = 0; for (let i = 1; i < pts.length; i++) s += dist(pts[i - 1], pts[i]); return s; }
 function pointAt(pts, frac) {
   const total = pathLen(pts); let target = Math.max(0, Math.min(1, frac)) * total;
   for (let i = 1; i < pts.length; i++) { const d = dist(pts[i - 1], pts[i]); if (target <= d) { const t = d ? target / d : 0; return [pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * t, pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * t]; } target -= d; }
   return pts[pts.length - 1];
 }
-function makeGeometry(center, km, angleDeg, seed, shape) {
-  const meters = km * 1000, ang = (angleDeg * Math.PI) / 180, pts = [];
-  const rot = (x, y) => [x * Math.cos(ang) - y * Math.sin(ang), x * Math.sin(ang) + y * Math.cos(ang)];
-  if (shape === 'loop') {
-    const k = 0.62; const Pk = Math.PI * (3 * (1 + k) - Math.sqrt((3 + k) * (1 + 3 * k))); const a = meters / Pk, b = a * k;
-    for (let i = 0; i <= 64; i++) { const t = Math.PI + (i / 64) * Math.PI * 2; const w = 1 + 0.07 * Math.sin(3 * t + seed); const [x, y] = rot((a + a * Math.cos(t)) * w, b * Math.sin(t) * w); pts.push(offset(center, x, y)); }
-    pts[pts.length - 1] = center;
-  } else {
-    const straight = meters * 0.9;
-    for (let i = 0; i <= 48; i++) { const f = i / 48; const lat = Math.sin(f * Math.PI * 2 + seed) * meters * 0.05 * Math.sin(f * Math.PI); const [x, y] = rot(f * straight, lat); pts.push(offset(center, x, y)); }
+/* Real routes: places from OpenStreetMap, paths along real streets (see routing.js). */
+const ROUTE_CACHE_MS = 6 * 3600e3;
+function routesCacheKey() { const c = state.me || DEMO_CENTER; return `${c[0].toFixed(3)},${c[1].toFixed(3)}|${state.settings.shape}|${Math.round(goalKm() * 10)}`; }
+const onHome = () => /^#?\/?(favorites)?$/.test(location.hash);
+async function loadRoutes() {
+  const token = (loadRoutes.token = (loadRoutes.token || 0) + 1); // newer request wins
+  const key = routesCacheKey();
+  const cached = store.get('routecache', null);
+  if (cached && cached.key === key && Date.now() - cached.t < ROUTE_CACHE_MS && cached.routes.length) {
+    state.routes = cached.routes; state.routesStatus = 'ready'; if (onHome()) render(); return;
   }
-  return pts.map(([a, b]) => [+a.toFixed(6), +b.toFixed(6)]);
+  state.routesStatus = 'loading'; state.routes = []; if (onHome()) render();
+  const photos = [];
+  // Only real photos of the place (Wikipedia / Wikimedia Commons); no stock pictures.
+  const prep = ({ place, ...r }) => ({ ...r, img: place.img || '', src: place, gallery: r.gallery.map(g => ({ id: g.id, name: g.name, img: g.img || '', src: g })) });
+  try {
+    await buildRealRoutes({
+      start: state.me || DEMO_CENTER, targetKm: goalKm(), shape: state.settings.shape,
+      onRoute: raw => {
+        if (token !== loadRoutes.token) return;
+        const r = prep(raw);
+        state.routes.push(r); state.routesStatus = 'partial'; // show cards as they come
+        if (onHome()) render();
+        photos.push(enrichPhotos([r]));
+      },
+    });
+    if (token !== loadRoutes.token) return;
+    state.routesStatus = 'ready';
+    if (onHome()) render();
+    await Promise.all(photos);
+    if (token !== loadRoutes.token) return;
+    if (state.routes.length) store.set('routecache', { key, t: Date.now(), routes: state.routes.map(plainRoute) });
+  } catch {
+    if (token !== loadRoutes.token) return;
+    state.routesStatus = state.routes.length ? 'ready' : 'error';
+    if (onHome()) render();
+  }
 }
-const VARIATION = [1, 0.93, 1.06, 0.9, 0.97, 1.04, 0.95, 1.08, 0.88, 1.02];
-function buildRoutes() {
-  const c = state.me || DEMO_CENTER, base = goalKm(), shape = state.settings.shape;
-  state.routes = PLACES.map((p, i) => {
-    const km = base * VARIATION[i];
-    return { key: `${p.id}-${shape}-${Math.round(km * 10)}`, placeId: p.id, name: p.name, km, shape, geometry: makeGeometry(c, km, i * 36 + 12, i * 1.7, shape) };
-  });
+/** Fill in real photos where the place has one; update cards in place so the carousel does not jump. */
+async function enrichPhotos(routes) {
+  const jobs = [];
+  for (const r of routes) {
+    if (!r.img && r.src) jobs.push(placePhoto(r.src).then(url => {
+      if (!url) return;
+      r.img = url;
+      const el = document.querySelector(`.route-card[data-key="${CSS.escape(r.key)}"]`);
+      if (el) { el.style.backgroundImage = `url('${url}')`; el.classList.remove('noimg'); el.querySelector('.noimg-ic')?.remove(); }
+    }));
+    for (const g of r.gallery || []) if (!g.img && g.src) jobs.push(placePhoto(g.src).then(url => { if (url) g.img = url; }));
+  }
+  await Promise.all(jobs);
 }
+/** Route without live source objects — safe to keep in localStorage. */
+const plainRoute = ({ src, ...r }) => ({ ...r, gallery: (r.gallery || []).map(({ src: _s, ...g }) => g) });
+const imgOf = x => x.img || (PLACES.find(p => p.id === x.placeId) || {}).img || '';
 const routeMeta = r => `${fmtKm(r.km)} · ${fmtSteps(kmToSteps(r.km))} шагов`;
 const isFav = r => state.favorites.some(f => f.key === r.key);
+const favCopy = r => ({ ...plainRoute(r), img: imgOf(r) });
 function toggleFav(r) {
   if (isFav(r)) { state.favorites = state.favorites.filter(f => f.key !== r.key); toast('Убрали из избранного'); }
-  else { state.favorites.unshift({ key: r.key, placeId: r.placeId, name: r.name, km: r.km, shape: r.shape, geometry: r.geometry }); toast('Маршрут в избранном. Он появится на главной'); }
+  else { state.favorites.unshift(favCopy(r)); toast('Маршрут в избранном. Он появится на главной'); }
   save('favorites');
 }
-function galleryFor(placeId) { const i = PLACES.findIndex(p => p.id === placeId); return [0, 4, 5, 6].map(o => PLACES[(i + o) % PLACES.length]); }
 
 /* ---------------- map ---------------- */
 let map, meMarker, routeLayer, followMe = false;
+/* Base map follows the app theme: light map in light theme, dark map in dark theme.
+   Temporary: OpenStreetMap tiles, darkened with a CSS filter (styles.css → .map-dark), until the Google Maps key is connected. */
+const darkMq = window.matchMedia('(prefers-color-scheme: dark)');
+const appTheme = () => document.documentElement.dataset.theme || (darkMq.matches ? 'dark' : 'light');
+const themedTiles = m => L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(m);
+const applyMapTheme = () => document.documentElement.classList.toggle('map-dark', appTheme() === 'dark');
+darkMq.addEventListener('change', applyMapTheme);
+new MutationObserver(applyMapTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 function initMap() {
   map = L.map('map', { zoomControl: false, attributionControl: true }).setView(DEMO_CENTER, 15);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(map);
+  themedTiles(map);
   map.attributionControl.setPrefix(false);
   routeLayer = L.layerGroup().addTo(map);
+  applyMapTheme();
 }
 const divIcon = cls => L.divIcon({ className: '', html: `<div class="${cls}"></div>`, iconSize: [22, 22], iconAnchor: [11, 11] });
 function setMe(latlng) {
@@ -147,7 +189,7 @@ function drawRoute(geom, shape, { fit = true, bottom = 360, traveled = null } = 
 }
 function miniMap(el, geom, shape) {
   const m = L.map(el, { zoomControl: false, attributionControl: false, dragging: false, scrollWheelZoom: false, doubleClickZoom: false, touchZoom: false, boxZoom: false, keyboard: false });
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(m);
+  themedTiles(m);
   const color = getComputedStyle(document.documentElement).getPropertyValue('--brand').trim() || '#2463eb';
   L.polyline(geom, { color, weight: 5, lineCap: 'round' }).addTo(m);
   m.fitBounds(L.latLngBounds(geom), { padding: [20, 20] });
@@ -165,8 +207,24 @@ function locate({ quiet = false } = {}) {
     { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 }
   );
 }
-function afterLocated() { buildRoutes(); state.loadingUntil = Date.now() + 900; setMe(state.me); map.setView(state.me, 15); render(); setTimeout(render, 950); }
+function afterLocated() {
+  setMe(state.me); map.setView(state.me, 15);
+  loadRoutes();
+  reverseGeocode(state.me).then(text => { state.address = text; const el = $('#loc-text'); if (el) el.textContent = locLabel(); });
+}
 function useDemo() { state.demo = true; locate(); }
+const addrCache = new Map();
+async function reverseGeocode([lat, lng]) {
+  const key = lat.toFixed(4) + ',' + lng.toFixed(4);
+  if (addrCache.has(key)) return addrCache.get(key);
+  try {
+    const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&addressdetails=1&accept-language=ru&lat=${lat}&lon=${lng}`);
+    const j = await r.json(); const a = j.address || {};
+    const street = a.road || a.pedestrian || a.footway || a.square || a.neighbourhood || a.suburb || '';
+    const text = [street, a.house_number].filter(Boolean).join(', ') || (j.display_name || '').split(',')[0];
+    addrCache.set(key, text); return text;
+  } catch { return ''; }
+}
 
 /* ---------------- UI helpers ---------------- */
 const ui = () => $('#ui');
@@ -194,19 +252,9 @@ function tabbar(active) {
   return `<nav class="tabbar" aria-label="Разделы">${t('#/history', 'history', 'История', 'history')}${t('#/', 'walk', 'Прогулка', 'footprints')}${t('#/profile', 'profile', 'Профиль', 'user')}</nav>`;
 }
 const tile = (ic, label, value) => `<div class="tile"><span class="l">${icon(ic, 16)}${esc(label)}</span><span class="v">${esc(value)}</span></div>`;
-const locLabel = () => (state.demo ? 'Хамовники, Москва · демо' : state.geo === 'ok' ? 'Вы здесь' : state.geo === 'pending' ? 'Определяем местоположение…' : 'Местоположение не найдено');
+const locLabel = () => (state.demo ? 'Хамовники, Москва · демо' : state.geo === 'ok' ? (state.address || 'Определяем адрес…') : state.geo === 'pending' ? 'Определяем местоположение…' : 'Местоположение не найдено');
 
 /* ---------------- screens ---------------- */
-function screenWelcome() {
-  ui().className = '';
-  return `<section class="sheet solo pad" aria-labelledby="w-t" style="gap:16px;padding-top:32px">
-    <div style="width:72px;height:72px;border-radius:50%;background:var(--brand-a10);color:var(--info-text);display:grid;place-items:center">${icon('locateFixed', 32)}</div>
-    <h1 class="h-md" id="w-t">Покажем маршруты рядом с вами</h1>
-    <p class="muted" style="margin:0">По геопозиции мы подбираем прогулки от вашей точки и ведём по маршруту. Трек хранится только на телефоне.</p>
-    <div class="stack"><button class="btn primary block" data-action="allow">Разрешить доступ</button><button class="btn ghost block" data-action="demo">Посмотреть на демо-районе</button></div>
-  </section>`;
-}
-
 function messageSheet({ ic, title, text, actions }) {
   return `<section class="sheet with-tabbar pad" style="align-items:center;text-align:center;gap:12px;padding-top:12px">
     <div class="grabber"></div>
@@ -219,12 +267,14 @@ function screenHome(tab = 'nearby') {
   ui().className = '';
   routeLayer.clearLayers();
   setMe(state.me);
-  const top = `<div class="topbar"><div class="loc-chip">${icon(state.geo === 'ok' ? 'mapPin' : 'mapPinOff', 16)}<span>${esc(locLabel())}</span></div></div><div class="spacer"></div>`;
+  const top = `<div class="topbar"><div class="loc-chip">${icon(state.geo === 'ok' ? 'mapPin' : 'mapPinOff', 16)}<span id="loc-text">${esc(locLabel())}</span></div></div><div class="spacer"></div>`;
   const ctrls = state.me ? `<div class="map-ctrls"><button class="icon-btn map" data-action="recenter" aria-label="Показать меня на карте">${icon('locateFixed', 24)}</button></div>` : '';
   if (!navigator.onLine) return top + messageSheet({ ic: 'wifiOff', title: 'Нет связи', text: 'Не можем загрузить карту и маршруты. Проверьте интернет и попробуйте ещё раз.', actions: `<button class="btn primary block" data-action="retry">${icon('refresh', 20)}Повторить</button>` }) + tabbar('walk');
   if (state.geo === 'denied' || state.geo === 'unavailable') return top + messageSheet({ ic: 'mapPinOff', title: 'Не удалось определить геопозицию', text: state.geo === 'denied' ? 'Разрешите доступ к геопозиции для браузера в настройках телефона, затем нажмите «Повторить».' : 'Сигнал GPS слабый или выключен. Выйдите на открытое место и попробуйте снова.', actions: `<button class="btn primary block" data-action="retry">Повторить</button><button class="btn ghost block" data-action="demo">Посмотреть на демо-районе</button>` }) + tabbar('walk');
 
-  const loading = state.geo === 'pending' || Date.now() < state.loadingUntil;
+  if (state.routesStatus === 'error') return top + ctrls + messageSheet({ ic: 'route', title: 'Не получилось построить маршруты', text: 'Сервис маршрутов сейчас не отвечает. Попробуйте ещё раз через минуту.', actions: `<button class="btn primary block" data-action="reload-routes">${icon('refresh', 20)}Повторить</button>` }) + tabbar('walk');
+  if (state.routesStatus === 'ready' && !state.routes.length && tab !== 'fav') return top + ctrls + messageSheet({ ic: 'mapPinOff', title: 'Рядом нет подходящих маршрутов', text: 'Не нашли парков и интересных мест на таком расстоянии. Попробуйте другую продолжительность или форму маршрута.', actions: `<a class="btn primary block" href="#/settings">Изменить настройки</a><button class="btn ghost block" data-action="reload-routes">${icon('refresh', 20)}Повторить поиск</button>` }) + tabbar('walk');
+  const loading = state.geo === 'pending' || state.routesStatus === 'loading' || state.routesStatus === 'idle';
   const hasFav = state.favorites.length > 0;
   const tabs = hasFav ? `<div class="pad"><div class="segmented" role="tablist">
       <a href="#/" role="tab" ${tab === 'nearby' ? 'aria-current="page" aria-selected="true"' : 'aria-selected="false"'}>${icon('locateFixed', 16)}Рядом</a>
@@ -237,15 +287,16 @@ function screenHome(tab = 'nearby') {
     body = `<div class="carousel" role="list" aria-label="Избранные маршруты">${state.favorites.map((f, i) => card(f, `#/fav/${i}`, true)).join('')}</div>`;
   } else {
     body = `<div class="pad chips"><a class="chip" href="#/settings" aria-label="Цель: ${esc(goalChip())}. Изменить">${esc(goalChip())}</a><a class="chip" href="#/settings" aria-label="Форма: ${esc(shapeChip())}. Изменить">${esc(shapeChip())}</a></div>
-      <div class="carousel" role="list" aria-label="Маршруты рядом">${state.routes.map((r, i) => card(r, `#/route/${i}`, isFav(r))).join('')}</div>`;
+      <div class="carousel" role="list" aria-label="Маршруты рядом" ${state.routesStatus === 'partial' ? 'aria-busy="true"' : ''}>${state.routes.map((r, i) => card(r, `#/route/${i}`, isFav(r))).join('')}${state.routesStatus === 'partial' ? '<div class="route-card skeleton" aria-hidden="true"></div>' : ''}</div>`;
   }
   return `${top}${ctrls}<section class="sheet with-tabbar" aria-labelledby="home-t">
       <div class="row pad"><h1 class="h-sm grow" id="home-t">Маршруты для прогулки</h1><a class="icon-btn" href="#/settings" aria-label="Настройки подбора">${icon('sliders', 24)}</a></div>
       ${tabs}${body}</section>${tabbar('walk')}`;
 }
 function card(r, href, fav) {
-  const p = placeById(r.placeId);
-  return `<a class="route-card" role="listitem" href="${href}" style="background-image:url('${p.img}')" aria-label="${esc(r.name)}, ${esc(routeMeta(r))}${fav ? ', в избранном' : ''}">
+  const img = imgOf(r);
+  return `<a class="route-card${img ? '' : ' noimg'}" role="listitem" href="${href}" data-key="${esc(r.key)}" ${img ? `style="background-image:url('${esc(img)}')"` : ''} aria-label="${esc(r.name)}, ${esc(routeMeta(r))}${fav ? ', в избранном' : ''}">
+    ${img ? '' : `<span class="noimg-ic" aria-hidden="true">${icon('mapPin', 32)}</span>`}
     ${fav ? `<span class="fav-badge">${icon('heart', 16, { filled: true })}</span>` : ''}<span class="t">${esc(r.name)}</span><span class="m">${esc(routeMeta(r))}</span></a>`;
 }
 
@@ -299,16 +350,17 @@ function screenPreview(kind, i) {
   setMe(state.me);
   requestAnimationFrame(() => drawRoute(r.geometry, r.shape, { bottom: Math.min(560, window.innerHeight * 0.62) }));
   const fav = isFav(r);
-  const sub = r.shape === 'loop' ? 'Замкнутый маршрут, старт и финиш у вас' : `В одну сторону, финиш у места «${esc(galleryFor(r.placeId)[1].name)}»`;
+  const sub = r.shape === 'loop' ? (r.kind ? `${esc(r.kind)} · замкнутый маршрут, старт и финиш у вас` : 'Замкнутый маршрут, старт и финиш у вас') : `В одну сторону, финиш у места «${esc(r.endName || r.name)}»`;
+  const gallery = r.gallery || [];
   return `<div class="topbar"><a class="icon-btn map" href="${kind === 'fav' ? '#/favorites' : '#/'}" aria-label="Назад">${icon('chevronLeft', 24)}</a>
       <button class="icon-btn map ${fav ? 'active' : ''}" data-action="fav" aria-pressed="${fav}" aria-label="${fav ? 'Убрать из избранного' : 'Добавить в избранное'}">${icon('heart', 24, { filled: fav })}</button></div>
     <div class="spacer"></div>
     <section class="sheet solo" aria-labelledby="pv-t" style="gap:16px">
       <div class="grabber"></div>
       <div class="pad stack" style="gap:4px"><h1 class="h-md" id="pv-t">${esc(r.name)}</h1><p class="body-sm muted" style="margin:0">${sub}</p></div>
-      <div class="stack" style="gap:8px"><h2 class="label-lg pad" style="margin:0">Что увидите по пути</h2>
-        <div class="gallery">${galleryFor(r.placeId).map(p => `<figure><img src="${p.img}" alt="${esc(p.name)}" loading="lazy"><figcaption>${esc(p.name)}</figcaption></figure>`).join('')}</div></div>
-      <div class="tiles pad">${tile('clock', 'Время', fmtDur(kmToMin(r.km)))}${tile('footprints', 'Шаги', fmtSteps(kmToSteps(r.km)))}${tile('route', 'Путь', fmtKm(r.km))}</div>
+      ${gallery.length ? `<div class="stack" style="gap:8px"><h2 class="label-lg pad" style="margin:0">Что увидите по пути</h2>
+        <div class="gallery">${gallery.map(p => `<figure>${p.img ? `<img src="${esc(p.img)}" alt="${esc(p.name)}" loading="lazy">` : `<span class="ph" aria-hidden="true">${icon('mapPin', 24)}</span>`}<figcaption>${esc(p.name)}</figcaption></figure>`).join('')}</div></div>` : ''}
+      <div class="tiles pad">${tile('clock', 'Время', fmtDurShort(kmToMin(r.km)))}${tile('footprints', 'Шаги', fmtSteps(kmToSteps(r.km)))}${tile('route', 'Путь', fmtKm(r.km))}</div>
       <div class="pad"><button class="btn primary block" data-action="start" data-kind="${kind}" data-i="${i}">Начать прогулку</button></div>
     </section>`;
 }
@@ -380,7 +432,7 @@ async function askFinish(atFinish = false) {
   if (!ok) return;
   clearInterval(walkTimer); if (watchId != null) navigator.geolocation.clearWatch(watchId); watchId = null;
   if (tooShort) { state.walk = null; location.hash = '#/'; toast('Прогулка не сохранена'); return; }
-  const entry = { id: 'w' + Date.now(), date: new Date().toISOString(), placeId: w.route.placeId, name: w.route.name, km: +w.km.toFixed(2), minutes: Math.round(w.elapsed / 60000), steps: Math.round(kmToSteps(w.km)), kcal: kcal(w.km), shape: w.route.shape, geometry: w.route.geometry, routeKm: w.route.km };
+  const entry = { id: 'w' + Date.now(), date: new Date().toISOString(), placeId: w.route.placeId, routeKey: w.route.key, name: w.route.name, img: imgOf(w.route), km: +w.km.toFixed(2), minutes: Math.round(w.elapsed / 60000), steps: Math.round(kmToSteps(w.km)), kcal: kcal(w.km), shape: w.route.shape, geometry: w.route.geometry, routeKm: w.route.km };
   state.history.unshift(entry); save('history');
   state.lastWalk = entry; state.walk = null;
   location.hash = '#/results';
@@ -417,9 +469,9 @@ function screenHistory() {
   </div>${tabbar('history')}`;
 }
 function walkRow(h) {
-  const p = placeById(h.placeId);
+  const img = imgOf(h);
   return `<div class="swipe" data-id="${h.id}"><button class="del" data-action="delete" data-id="${h.id}" tabindex="-1" aria-label="Удалить прогулку «${esc(h.name)}»">${icon('trash', 20)}Удалить</button>
-    <a class="walk-row" href="#/history/${h.id}" draggable="false"><img src="${p.img}" alt="" draggable="false"><span class="grow stack" style="gap:0"><span class="t">${esc(h.name)}</span><span class="caption muted">${esc(fmtDate(h.date))} · ${fmtDur(h.minutes)}</span><span class="body-sm secondary-text">${fmtKm(h.km)} · ${nf.format(h.steps)} шагов</span></span><span class="chev">${icon('chevronRight', 16)}</span></a></div>`;
+    <a class="walk-row" href="#/history/${h.id}" draggable="false">${img ? `<img src="${esc(img)}" alt="" draggable="false">` : `<span class="thumb-ph" aria-hidden="true">${icon('mapPin', 24)}</span>`}<span class="grow stack" style="gap:0"><span class="t">${esc(h.name)}</span><span class="caption muted">${esc(fmtDate(h.date))} · ${fmtDur(h.minutes)}</span><span class="body-sm secondary-text">${fmtKm(h.km)} · ${nf.format(h.steps)} шагов</span></span><span class="chev">${icon('chevronRight', 16)}</span></a></div>`;
 }
 function bindSwipe() {
   for (const wrap of $$('.swipe')) {
@@ -444,11 +496,12 @@ function deleteWalk(id) {
   const [removed] = state.history.splice(idx, 1); save('history'); render();
   toast('Прогулка удалена', { label: 'Отменить', run: () => { state.history.splice(idx, 0, removed); save('history'); render(); } });
 }
+/** A history entry as a route, so it can go to favorites. Key matches the one routing.js gives. */
+const historyRoute = h => ({ key: h.routeKey || `${h.placeId}-${h.shape}-${Math.round(h.routeKm * 10)}`, placeId: h.placeId, name: h.name, img: imgOf(h), km: h.routeKm, shape: h.shape, geometry: h.geometry, gallery: [] });
 function screenDetails(id) {
   const h = state.history.find(x => x.id === id); if (!h) { location.hash = '#/history'; return ''; }
   ui().className = 'full';
-  const r = { key: `${h.placeId}-${h.shape}-${Math.round(h.routeKm * 10)}`, placeId: h.placeId, name: h.name, km: h.routeKm, shape: h.shape, geometry: h.geometry };
-  const fav = isFav(r);
+  const fav = isFav(historyRoute(h));
   requestAnimationFrame(() => miniMap($('#mm'), h.geometry, h.shape));
   return `<div class="page page-top" style="gap:16px">
     <a class="icon-btn" href="#/history" aria-label="Назад к истории">${icon('chevronLeft', 24)}</a>
@@ -471,7 +524,7 @@ function screenProfile() {
       <div class="field"><label for="pf-s">Длина шага, см</label><input id="pf-s" inputmode="numeric" type="number" min="40" max="120" value="${esc(state.profile.stepCm)}" aria-describedby="pf-sh"><span class="hint" id="pf-sh">Обычно 65–80 см. Влияет на количество шагов.</span></div>
       <button class="btn primary block" type="submit">Сохранить</button>
     </form>
-    <div class="card"><h2 class="h-sm">Демо</h2><p class="body-sm muted" style="margin:0">Маршруты строятся вокруг вашей точки, фото мест — иллюстрации. На демо-районе прогулка идёт в ускоренном режиме ×${DEMO_SPEEDUP}.</p>
+    <div class="card"><h2 class="h-sm">Демо</h2><p class="body-sm muted" style="margin:0">Маршруты идут по реальным улицам и тропинкам. Места и пути — из OpenStreetMap, фото — из Википедии, если они там есть. На демо-районе прогулка идёт в ускоренном режиме ×${DEMO_SPEEDUP}.</p>
       <button class="btn secondary block" data-action="seed">Добавить примеры в историю</button></div>
     <button class="btn ghost block" style="color:var(--danger)" data-action="wipe">${icon('trash', 20)}Удалить все данные</button>
   </div>${tabbar('profile')}`;
@@ -484,8 +537,7 @@ function render() {
   $('#modal').innerHTML = '';
   if (a !== 'settings') state.draft = null;
   let html = '';
-  if (!store.get('welcomed', false) && !state.demo) html = screenWelcome();
-  else if (a === 'settings') html = screenSettings();
+  if (a === 'settings') html = screenSettings();
   else if (a === 'route') html = screenPreview('nearby', +b);
   else if (a === 'fav') html = screenPreview('fav', +b);
   else if (a === 'favorites') html = screenHome(state.favorites.length ? 'fav' : 'nearby');
@@ -496,11 +548,16 @@ function render() {
   else if (a === 'profile') html = screenProfile();
   else html = state.walk ? (location.hash = '#/walk', '') : screenHome('nearby');
   if (html === '' && a !== '' && a !== undefined) return;
+  const sameScreen = render.last === h, keepX = sameScreen ? ($('.carousel') || {}).scrollLeft : 0;
+  render.last = h;
   ui().innerHTML = html;
   ui().scrollTop = 0;
+  if (keepX) { const c = $('.carousel'); if (c) c.scrollLeft = keepX; } // re-render while routes arrive: keep the user's place
+  if (sameScreen) $$('#ui > .sheet').forEach(s => (s.style.animation = 'none')); // no slide-in on a refresh of the same screen
   if (a === 'history' && !b) bindSwipe();
   if (a === 'profile') bindProfile();
   if (a === 'settings') bindSettings();
+  if (['settings', 'route', 'fav'].includes(a)) bindSheetDismiss();
   if (!['route', 'fav', 'walk'].includes(a)) routeLayer && a !== 'walk' && routeLayer.clearLayers();
   setTimeout(() => map.invalidateSize(), 0);
 }
@@ -514,11 +571,51 @@ function bindSettings() {
     const km = goalKm(d); $('#rng-hint').textContent = d.goal === 'time' ? `Около ${fmtKm(km)} спокойным шагом` : `Около ${fmtKm(km)}, это примерно ${fmtDur(kmToMin(km))}`;
   });
 }
+/* Dismissable sheets: X button, system back gesture, and swipe down from the grabber area. */
+let prevHash = '';
+function closeSheet() {
+  const from = prevHash.replace(/^#\/?/, '');
+  if (from && !/^(walk|results)/.test(from) && history.length > 1) history.back();
+  else location.hash = '#/';
+}
+function bindSheetDismiss() {
+  const sheet = $('#ui > .sheet');
+  if (!sheet) return;
+  let y0 = 0, dy = 0, t0 = 0, drag = false;
+  sheet.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || e.target.closest('button, a, input, label')) return;
+    if (e.clientY - sheet.getBoundingClientRect().top > 56) return;
+    drag = true; y0 = e.clientY; dy = 0; t0 = Date.now();
+    sheet.style.transition = 'none';
+  });
+  sheet.addEventListener('pointermove', e => {
+    if (!drag) return;
+    dy = Math.max(0, e.clientY - y0);
+    sheet.style.transform = `translateY(${dy}px)`;
+  });
+  const end = () => {
+    if (!drag) return; drag = false;
+    const speed = dy / Math.max(1, Date.now() - t0);
+    sheet.style.transition = 'transform var(--t-base) var(--ease-out)';
+    if (dy > 96 || (speed > 0.6 && dy > 30)) {
+      sheet.style.transform = `translateY(${window.innerHeight}px)`;
+      setTimeout(closeSheet, 250);
+    } else {
+      sheet.style.transform = '';
+    }
+  };
+  sheet.addEventListener('pointerup', end);
+  sheet.addEventListener('pointercancel', end);
+}
+
 function bindProfile() {
   $('#pf').addEventListener('submit', e => { e.preventDefault(); const w = $('#pf-w').value.trim(), s = $('#pf-s').value.trim();
     if (w && (+w < 30 || +w > 250)) { toast('Вес должен быть от 30 до 250 кг'); $('#pf-w').focus(); return; }
     if (s && (+s < 40 || +s > 120)) { toast('Длина шага — от 40 до 120 см'); $('#pf-s').focus(); return; }
-    state.profile = { weight: w, stepCm: s || 75 }; save('profile'); buildRoutes(); toast('Сохранили'); });
+    const stepChanged = String(s || 75) !== String(state.profile.stepCm);
+    state.profile = { weight: w, stepCm: s || 75 }; save('profile');
+    if (stepChanged && state.settings.goal === 'steps' && state.me) loadRoutes(); // goal in steps → distance changed
+    toast('Сохранили'); });
 }
 
 /* ---------------- actions ---------------- */
@@ -529,41 +626,44 @@ document.addEventListener('click', async e => {
   if (el.dataset.preset) { const v = +el.dataset.preset; if (d.goal === 'time') { d.time = v; d.customTime = false; } else { d.steps = v; d.customSteps = false; } render(); return; }
   if (el.dataset.shape) { d.shape = el.dataset.shape; render(); return; }
   switch (el.dataset.action) {
-    case 'allow': store.set('welcomed', true); locate(); break;
-    case 'demo': store.set('welcomed', true); useDemo(); location.hash = '#/'; break;
+    case 'demo': useDemo(); location.hash = '#/'; break;
     case 'retry': locate(); break;
     case 'recenter': if (state.me) map.setView(state.me, 16); break;
     case 'follow': { const w = state.walk; const p = w && (w.mode === 'demo' ? pointAt(w.route.geometry, w.km / w.route.km) : w.last); if (p) map.setView(p, 17); break; }
     case 'custom': if (d.goal === 'time') d.customTime = true; else d.customSteps = true; render(); break;
-    case 'close-settings': location.hash = '#/'; break;
-    case 'apply': state.settings = { ...d }; save('settings'); buildRoutes(); state.loadingUntil = Date.now() + 1100; location.hash = '#/'; setTimeout(() => { if (!location.hash.replace(/^#\/?/, '')) render(); }, 1150); break;
+    case 'close-settings': closeSheet(); break;
+    case 'apply': state.settings = { ...d }; save('settings'); location.hash = '#/'; loadRoutes(); break;
     case 'fav': { const [, kind, i] = location.hash.match(/#\/(route|fav)\/(\d+)/) || []; const r = getRoute(kind === 'fav' ? 'fav' : 'nearby', +i); if (r) { toggleFav(r); if (kind === 'fav') location.hash = '#/favorites'; else render(); } break; }
     case 'start': startWalk(getRoute(el.dataset.kind, +el.dataset.i)); break;
     case 'pause': state.walk.paused = true; render(); break;
     case 'resume': state.walk.paused = false; render(); break;
     case 'stop': askFinish(false); break;
     case 'delete': deleteWalk(el.dataset.id); break;
-    case 'fav-h': { const h = state.history.find(x => x.id === el.dataset.id); toggleFav({ key: `${h.placeId}-${h.shape}-${Math.round(h.routeKm * 10)}`, placeId: h.placeId, name: h.name, km: h.routeKm, shape: h.shape, geometry: h.geometry }); render(); break; }
+    case 'fav-h': { const h = state.history.find(x => x.id === el.dataset.id); toggleFav(historyRoute(h)); render(); break; }
+    case 'reload-routes': loadRoutes(); break;
     case 'share': { const h = state.history.find(x => x.id === el.dataset.id); const text = `${h.name}: ${fmtKm(h.km)}, ${nf.format(h.steps)} шагов за ${fmtDur(h.minutes)}. Маршрут из Шагалки`;
       try { if (navigator.share) await navigator.share({ title: 'Шагалка', text, url: location.origin + location.pathname }); else { await navigator.clipboard.writeText(text); toast('Скопировали описание маршрута'); } } catch { /* cancelled */ } break; }
-    case 'seed': seedHistory(); toast('Добавили 5 прогулок в историю'); break;
+    case 'seed': { const n = seedHistory(); toast(n ? `Добавили ${n} ${plural(n, ['прогулку', 'прогулки', 'прогулок'])} в историю` : 'Сначала дождитесь, пока построятся маршруты на главной'); break; }
     case 'wipe': if (await confirmDialog({ title: 'Удалить все данные?', text: 'История, избранное и настройки сотрутся с этого телефона. Отменить это нельзя.', confirm: 'Удалить', danger: true })) { store.clear(); location.hash = '#/'; location.reload(); } break;
   }
 });
+/** Sample history from the real routes built around the user. Returns how many were added. */
 function seedHistory() {
-  const c = state.me || DEMO_CENTER; const now = Date.now();
-  const items = [[0, 0.1, 62], [1, 1, 55], [2, 2.3, 71], [3, 4.2, 48], [4, 6.1, 60]];
-  for (const [pi, daysAgo, min] of items) { const p = PLACES[pi]; const km = (min / 60) * WALK_KMH * 1.05; state.history.push({ id: 'seed' + pi + now, date: new Date(now - daysAgo * 864e5).toISOString(), placeId: p.id, name: p.name, km: +km.toFixed(2), minutes: min, steps: Math.round(kmToSteps(km)), kcal: kcal(km), shape: 'loop', geometry: makeGeometry(c, km, pi * 36 + 12, pi * 1.7, 'loop'), routeKm: km }); }
+  const now = Date.now(), ago = [0.1, 1, 2.3, 4.2, 6.1];
+  const src = state.routes.slice(0, ago.length);
+  src.forEach((r, i) => {
+    state.history.push({ id: 'seed' + i + now, date: new Date(now - ago[i] * 864e5).toISOString(), placeId: r.placeId, routeKey: r.key, name: r.name, img: imgOf(r), km: +r.km.toFixed(2), minutes: Math.round(kmToMin(r.km) * 1.05), steps: Math.round(kmToSteps(r.km)), kcal: kcal(r.km), shape: r.shape, geometry: r.geometry, routeKm: r.km });
+  });
   state.history.sort((a, b) => new Date(b.date) - new Date(a.date)); save('history');
+  return src.length;
 }
 
 /* ---------------- boot ---------------- */
-window.addEventListener('hashchange', render);
+window.addEventListener('hashchange', e => { prevHash = e.oldURL ? new URL(e.oldURL).hash : ''; render(); });
 window.addEventListener('online', render);
 window.addEventListener('offline', render);
 initMap();
-if (new URLSearchParams(location.search).has('demo')) { store.set('welcomed', true); state.demo = true; }
-buildRoutes();
+if (new URLSearchParams(location.search).has('demo')) state.demo = true;
 render();
-if (store.get('welcomed', false) || state.demo) locate({ quiet: true });
+locate({ quiet: true }); // геопозиция определяется сразу при входе
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
