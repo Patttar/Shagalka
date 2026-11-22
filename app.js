@@ -42,10 +42,11 @@ const state = {
   settings: store.get('settings', { goal: 'time', time: 60, steps: 5000, customTime: false, customSteps: false, shape: 'loop' }),
   favorites: store.get('favorites', []),
   history: store.get('history', []),
-  profile: store.get('profile', { weight: '', stepCm: 75 }),
+  profile: { height: '', weight: '', marker: 'dot', ...store.get('profile', {}) },
   me: null,
   address: '',
-  geo: 'pending', // pending | ok | denied | unavailable
+  geo: 'pending', // pending | ok | denied | unavailable | skipped (asked later) | off (declined for now)
+  picking: false, // choosing the start point on the map by hand
   demo: false,
   routes: [],
   routesStatus: 'idle', // idle | loading | ready | error
@@ -74,8 +75,16 @@ const fmtClock = ms => { const s = Math.floor(ms / 1000), h = Math.floor(s / 360
 const fmtDate = iso => { const d = new Date(iso), now = new Date(); const t = d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }); const day = new Date(now.getFullYear(), now.getMonth(), now.getDate()); const dd = new Date(d.getFullYear(), d.getMonth(), d.getDate()); const diff = (day - dd) / 864e5; if (diff === 0) return 'Сегодня, ' + t; if (diff === 1) return 'Вчера, ' + t; return d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' }); };
 
 /* ---------------- calculations ---------------- */
-const stepLen = () => Math.max(0.4, Math.min(1.2, (Number(state.profile.stepCm) || 75) / 100));
+/* Step length from height (≈ 41.5% of height); old profiles kept a step length directly. */
+const stepLen = () => { const h = Number(state.profile.height); return Math.max(0.4, Math.min(1.2, h ? (h * 0.415) / 100 : (Number(state.profile.stepCm) || 75) / 100)); };
 const weight = () => Number(state.profile.weight) || 70;
+const HEIGHT = { min: 120, max: 220, def: 170 }, WEIGHT = { min: 30, max: 200, def: 70 };
+/* Map markers from Figma (13 Профиль). The animals are emoji there too, for now. */
+const MARKERS = [
+  { id: 'dot', name: 'Точка' }, { id: 'frog', name: 'Лягушка', e: '🐸' }, { id: 'monkey', name: 'Обезьяна', e: '🐵' },
+  { id: 'dog', name: 'Собака', e: '🐶' }, { id: 'cat', name: 'Кошка', e: '🐱' }, { id: 'bear', name: 'Медведь', e: '🐻' },
+];
+const markerOf = id => MARKERS.find(m => m.id === id) || MARKERS[0];
 const kmToSteps = km => (km * 1000) / stepLen();
 const kmToMin = km => (km / WALK_KMH) * 60;
 const kcal = km => Math.round(0.5 * weight() * km);
@@ -170,14 +179,68 @@ function initMap() {
   map.attributionControl.setPrefix(false);
   routeLayer = L.layerGroup().addTo(map);
   applyMapTheme();
+  map.on('click', e => { if (state.picking) pickPoint(e.latlng); });
 }
-const divIcon = cls => L.divIcon({ className: '', html: `<div class="${cls}"></div>`, iconSize: [22, 22], iconAnchor: [11, 11] });
+function meIcon(id = state.profile.marker) {
+  const m = markerOf(id);
+  if (!m.e) return L.divIcon({ className: '', html: '<div class="me-marker"></div>', iconSize: [22, 22], iconAnchor: [11, 11] });
+  return L.divIcon({ className: '', html: `<div class="me-pet"><span>${m.e}</span></div>`, iconSize: [40, 40], iconAnchor: [20, 20] });
+}
 function setMe(latlng) {
   if (!latlng) { if (meMarker) { meMarker.remove(); meMarker = null; } return; }
-  if (!meMarker) meMarker = L.marker(latlng, { icon: divIcon('me-marker'), keyboard: false, interactive: false, zIndexOffset: 1000 }).addTo(map);
+  if (!meMarker) { meMarker = L.marker(latlng, { icon: meIcon(), keyboard: false, interactive: false, zIndexOffset: 1000 }).addTo(map); meMarker._kind = state.profile.marker; }
   else meMarker.setLatLng(latlng);
+  if (meMarker._kind !== state.profile.marker) { meMarker.setIcon(meIcon()); meMarker._kind = state.profile.marker; }
 }
-function drawRoute(geom, shape, { fit = true, bottom = 360, traveled = null } = {}) {
+
+/* Distances along a route (metres), cached per geometry array. */
+const cumCache = new WeakMap();
+function cums(g) {
+  let c = cumCache.get(g);
+  if (!c) { c = [0]; for (let i = 1; i < g.length; i++) c.push(c[i - 1] + dist(g[i - 1], g[i])); cumCache.set(g, c); }
+  return c;
+}
+function pointAtM(g, m) {
+  const c = cums(g), total = c[c.length - 1]; m = Math.max(0, Math.min(total, m));
+  let i = 1; while (i < c.length - 1 && c[i] < m) i++;
+  const d = c[i] - c[i - 1], t = d ? (m - c[i - 1]) / d : 0;
+  return [g[i - 1][0] + (g[i][0] - g[i - 1][0]) * t, g[i - 1][1] + (g[i][1] - g[i - 1][1]) * t];
+}
+const rad = x => (x * Math.PI) / 180;
+function bearingTo(a, b) {
+  const y = Math.sin(rad(b[1] - a[1])) * Math.cos(rad(b[0]));
+  const x = Math.cos(rad(a[0])) * Math.sin(rad(b[0])) - Math.sin(rad(a[0])) * Math.cos(rad(b[0])) * Math.cos(rad(b[1] - a[1]));
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+/** Next turn ahead of position `s` (metres along the route): looks at the heading 20 m before and after each vertex. */
+function nextManeuver(g, s) {
+  const c = cums(g), total = c[c.length - 1];
+  for (let i = 1; i < g.length - 1; i++) {
+    if (c[i] < s + 8) continue;
+    const b1 = bearingTo(pointAtM(g, c[i] - 20), g[i]), b2 = bearingTo(g[i], pointAtM(g, c[i] + 20));
+    const turn = ((b2 - b1 + 540) % 360) - 180;
+    if (Math.abs(turn) >= 40) return { at: c[i] - s, turn };
+  }
+  return { at: Math.max(0, total - s), finish: true };
+}
+const fmtDistM = m => (m < 1000 ? `${Math.max(10, Math.round(m / 10) * 10)} м` : fmtKm(m / 1000));
+function maneuverView(m, shape) {
+  if (m.finish) return { ic: 'flag', dist: m.at < 15 ? 'Вы на финише' : `Финиш через ${fmtDistM(m.at)}`, text: shape === 'loop' ? 'Маршрут заканчивается там, где начался' : 'Конец маршрута' };
+  const a = Math.abs(m.turn), right = m.turn > 0;
+  const text = a > 150 ? 'Развернитесь' : a < 60 ? (right ? 'Держитесь правее' : 'Держитесь левее') : (right ? 'Поверните направо' : 'Поверните налево');
+  return { ic: a > 150 ? 'rotateCcw' : right ? 'cornerUpRight' : 'cornerUpLeft', dist: m.at < 15 ? 'Сейчас' : `Через ${fmtDistM(m.at)}`, text };
+}
+/** Where the walker is along the route, in metres. GPS: nearest vertex just ahead of the last known spot. */
+function walkS(w) {
+  const g = w.route.geometry, c = cums(g), total = c[c.length - 1];
+  if (w.mode === 'demo') return total * Math.min(1, w.km / w.route.km);
+  const p = w.last || g[0], from = (w.s || 0) - 30, to = (w.s || 0) + 400;
+  let best = w.s || 0, bd = Infinity;
+  for (let i = 0; i < g.length; i++) { if (c[i] < from || c[i] > to) continue; const d = dist(p, g[i]); if (d < bd) { bd = d; best = c[i]; } }
+  return (w.s = best);
+}
+
+function drawRoute(geom, shape, { fit = true, bottom = 360, traveled = null, arrowsFrom = null } = {}) {
   routeLayer.clearLayers();
   if (!geom) return;
   const color = getComputedStyle(document.documentElement).getPropertyValue('--brand').trim() || '#2463eb';
@@ -185,6 +248,15 @@ function drawRoute(geom, shape, { fit = true, bottom = 360, traveled = null } = 
   if (traveled && traveled.length > 1) L.polyline(traveled, { color, weight: 6, opacity: 1, lineCap: 'round' }).addTo(routeLayer);
   L.marker(geom[0], { icon: L.divIcon({ className: '', html: '<div class="pt-marker"></div>', iconSize: [16, 16], iconAnchor: [8, 8] }), interactive: false }).addTo(routeLayer);
   if (shape !== 'loop') L.marker(geom[geom.length - 1], { icon: L.divIcon({ className: '', html: '<div class="pt-marker finish"></div>', iconSize: [16, 16], iconAnchor: [8, 8] }), interactive: false }).addTo(routeLayer);
+  if (arrowsFrom != null) { // direction arrows on the part still ahead (RouteArrow in Figma)
+    const total = cums(geom)[geom.length - 1];
+    const mpp = (156543 * Math.cos(rad(geom[0][0]))) / 2 ** map.getZoom(); // metres per screen pixel
+    const gap = Math.max(150, 110 * mpp); // keep arrows ~110 px apart on screen
+    for (let m = arrowsFrom + Math.max(60, 50 * mpp), n = 0; m < total - 30 && n < 10; m += gap, n++) {
+      const b = bearingTo(pointAtM(geom, m - 5), pointAtM(geom, m + 5));
+      L.marker(pointAtM(geom, m), { icon: L.divIcon({ className: '', html: `<div class="route-arrow" style="transform:rotate(${(b - 90).toFixed(0)}deg)">${icon('chevronRight', 14)}</div>`, iconSize: [20, 20], iconAnchor: [10, 10] }), interactive: false, keyboard: false }).addTo(routeLayer);
+    }
+  }
   if (fit) map.fitBounds(L.latLngBounds(geom), { paddingTopLeft: [24, 90], paddingBottomRight: [24, bottom], maxZoom: 16 });
 }
 function miniMap(el, geom, shape) {
@@ -208,11 +280,17 @@ function locate({ quiet = false } = {}) {
   );
 }
 function afterLocated() {
+  store.set('geoAsk', true);
   setMe(state.me); map.setView(state.me, 15);
   loadRoutes();
   reverseGeocode(state.me).then(text => { state.address = text; const el = $('#loc-text'); if (el) el.textContent = locLabel(); });
 }
-function useDemo() { state.demo = true; locate(); }
+/** "Выбрать точку на карте": the next tap on the map becomes the start point. */
+function startPicking() { state.picking = true; location.hash = '#/'; render(); }
+function pickPoint(latlng) {
+  state.picking = false; state.me = [latlng.lat, latlng.lng]; state.geo = 'ok'; state.address = '';
+  render(); afterLocated();
+}
 const addrCache = new Map();
 async function reverseGeocode([lat, lng]) {
   const key = lat.toFixed(4) + ',' + lng.toFixed(4);
@@ -255,25 +333,58 @@ const tile = (ic, label, value) => `<div class="tile"><span class="l">${icon(ic,
 const locLabel = () => (state.demo ? 'Хамовники, Москва · демо' : state.geo === 'ok' ? (state.address || 'Определяем адрес…') : state.geo === 'pending' ? 'Определяем местоположение…' : 'Местоположение не найдено');
 
 /* ---------------- screens ---------------- */
-function messageSheet({ ic, title, text, actions }) {
-  return `<section class="sheet with-tabbar pad" style="align-items:center;text-align:center;gap:12px;padding-top:12px">
+/* Centred message in a sheet (Figma MessageSheet: NoLocation / NoConnection / NoRoutes). */
+function messageSheet({ ic, title, text, actions, after = '' }) {
+  return `<section class="sheet with-tabbar msg-sheet">
     <div class="grabber"></div>
-    <div style="width:56px;height:56px;border-radius:50%;background:var(--surface-subtle);display:grid;place-items:center;color:var(--fg-muted)">${icon(ic, 28)}</div>
-    <h1 class="h-sm">${esc(title)}</h1><p class="muted" style="margin:0;max-width:34ch">${esc(text)}</p>
-    <div class="stack" style="width:100%">${actions}</div></section>`;
+    <div class="msg-body"><span class="msg-ic">${icon(ic, 20)}</span>
+      <h1 class="h-sm">${esc(title)}</h1><p>${esc(text)}</p>${actions}</div>${after}</section>`;
+}
+/* 12 «Невыполнимые параметры»: say why, offer concrete fixes. */
+function noRoutesSheet() {
+  const s = state.settings, isTime = s.goal === 'time';
+  const smaller = isTime ? Math.max(15, Math.round((s.time * 0.5) / 15) * 15) : Math.max(1000, Math.round((s.steps * 0.6) / 1000) * 1000);
+  const what = isTime ? `гулять ${fmtGoalTime(s.time)}` : `пройти ${fmtSteps(s.steps)} шагов`;
+  const reduce = (isTime ? s.time : s.steps) > smaller
+    ? `<button class="option-row" data-action="reduce-goal" data-v="${smaller}">${icon(isTime ? 'clock' : 'footprints', 20)}<span class="grow stack" style="gap:2px"><span class="label-md">Уменьшить до ${isTime ? fmtGoalTime(smaller) : fmtSteps(smaller) + ' шагов'}</span><span class="body-sm secondary-text">Поищем маршруты покороче рядом с вами</span></span>${icon('chevronRight', 20)}</button>` : '';
+  const oneway = s.shape === 'loop'
+    ? `<button class="option-row" data-action="go-oneway">${icon('arrowRight', 20)}<span class="grow stack" style="gap:2px"><span class="label-md">Идти в одну сторону</span><span class="body-sm secondary-text">Финиш в другом месте, не нужно возвращаться</span></span>${icon('chevronRight', 20)}</button>` : '';
+  return `<section class="sheet with-tabbar pad" aria-labelledby="nr-t" style="gap:16px">
+    <div class="grabber"></div>
+    <h1 class="h-md" id="nr-t">Не нашли подходящий маршрут</h1>
+    <div class="warn-box" role="status"><strong class="label-md">Условия не сходятся</strong><span>Рядом мало пешеходных дорожек, чтобы ${what}${s.shape === 'loop' ? ' по кругу и вернуться к старту' : ' в одну сторону'}.</span></div>
+    ${reduce || oneway ? `<div class="stack" style="gap:4px"><h2 class="label-lg" style="margin:0">Что можно изменить</h2>${reduce}${oneway}</div>` : ''}
+    <a class="btn secondary block" href="#/settings">${icon('settings', 20)}Открыть настройки</a></section>`;
 }
 
 function screenHome(tab = 'nearby') {
   ui().className = '';
   routeLayer.clearLayers();
   setMe(state.me);
-  const top = `<div class="topbar"><div class="loc-chip">${icon(state.geo === 'ok' ? 'mapPin' : 'mapPinOff', 16)}<span id="loc-text">${esc(locLabel())}</span></div></div><div class="spacer"></div>`;
+  const top = `<div class="topbar center"><div class="loc-chip">${icon(state.geo === 'ok' ? 'mapPin' : 'mapPinOff', 16)}<span id="loc-text">${esc(locLabel())}</span></div></div><div class="spacer"></div>`;
   const ctrls = state.me ? `<div class="map-ctrls"><button class="icon-btn map" data-action="recenter" aria-label="Показать меня на карте">${icon('locateFixed', 24)}</button></div>` : '';
-  if (!navigator.onLine) return top + messageSheet({ ic: 'wifiOff', title: 'Нет связи', text: 'Не можем загрузить карту и маршруты. Проверьте интернет и попробуйте ещё раз.', actions: `<button class="btn primary block" data-action="retry">${icon('refresh', 20)}Повторить</button>` }) + tabbar('walk');
-  if (state.geo === 'denied' || state.geo === 'unavailable') return top + messageSheet({ ic: 'mapPinOff', title: 'Не удалось определить геопозицию', text: state.geo === 'denied' ? 'Разрешите доступ к геопозиции для браузера в настройках телефона, затем нажмите «Повторить».' : 'Сигнал GPS слабый или выключен. Выйдите на открытое место и попробуйте снова.', actions: `<button class="btn primary block" data-action="retry">Повторить</button><button class="btn ghost block" data-action="demo">Посмотреть на демо-районе</button>` }) + tabbar('walk');
+  if (state.picking) {
+    return `<div class="topbar center"><div class="loc-chip" role="status">${icon('mapPin', 16)}<span>Нажмите на карту, чтобы выбрать старт</span></div></div><div class="spacer"></div>
+      <div class="pick-bar"><button class="btn secondary block" data-action="cancel-pick">Отмена</button></div>`;
+  }
+  if (!navigator.onLine) return top + messageSheet({ ic: 'wifiOff', title: 'Нет связи с интернетом', text: 'Маршруты строятся онлайн. Как только связь появится, обновим список сами.', actions: `<button class="btn primary sm" data-action="retry">${icon('refresh', 20)}Повторить</button>` }) + tabbar('walk');
+  if (state.geo === 'skipped') {
+    return `<div class="spacer"></div><section class="sheet solo pad" aria-labelledby="ga-t" style="gap:16px;padding-top:24px">
+      <span class="ask-ic">${icon('locateFixed', 32)}</span>
+      <div class="stack" style="gap:8px"><h1 class="h-md" id="ga-t">Покажем маршруты рядом с вами</h1>
+      <p class="secondary-text" style="margin:0">По геопозиции мы подбираем прогулки от вашей точки и ведём по маршруту. Трек хранится только на телефоне.</p></div>
+      <div class="stack"><button class="btn primary block" data-action="retry">Разрешить доступ</button><button class="btn ghost block" data-action="geo-later">Не сейчас</button></div></section>`;
+  }
+  if (['denied', 'unavailable', 'off'].includes(state.geo)) {
+    const text = state.geo === 'denied' ? 'Разрешите доступ к геолокации в настройках браузера или выберите точку старта на карте вручную.'
+      : state.geo === 'unavailable' ? 'Сигнал GPS слабый. Выйдите на открытое место или выберите точку старта на карте вручную.'
+      : 'Разрешите доступ к геолокации или выберите точку старта на карте вручную.';
+    return top + messageSheet({ ic: 'mapPinOff', title: 'Не удалось определить, где вы', text, actions: `<button class="btn primary sm" data-action="retry">${icon('mapPin', 20)}Разрешить доступ</button>`,
+      after: `<button class="btn ghost block" data-action="pick">${icon('mapPin', 20)}Выбрать точку на карте</button>` }) + tabbar('walk');
+  }
 
-  if (state.routesStatus === 'error') return top + ctrls + messageSheet({ ic: 'route', title: 'Не получилось построить маршруты', text: 'Сервис маршрутов сейчас не отвечает. Попробуйте ещё раз через минуту.', actions: `<button class="btn primary block" data-action="reload-routes">${icon('refresh', 20)}Повторить</button>` }) + tabbar('walk');
-  if (state.routesStatus === 'ready' && !state.routes.length && tab !== 'fav') return top + ctrls + messageSheet({ ic: 'mapPinOff', title: 'Рядом нет подходящих маршрутов', text: 'Не нашли парков и интересных мест на таком расстоянии. Попробуйте другую продолжительность или форму маршрута.', actions: `<a class="btn primary block" href="#/settings">Изменить настройки</a><button class="btn ghost block" data-action="reload-routes">${icon('refresh', 20)}Повторить поиск</button>` }) + tabbar('walk');
+  if (state.routesStatus === 'error') return top + ctrls + messageSheet({ ic: 'route', title: 'Не получилось построить маршруты', text: 'Сервис маршрутов сейчас не отвечает. Попробуйте ещё раз через минуту.', actions: `<button class="btn primary sm" data-action="reload-routes">${icon('refresh', 20)}Повторить</button>` }) + tabbar('walk');
+  if (state.routesStatus === 'ready' && !state.routes.length && tab !== 'fav') return top + ctrls + noRoutesSheet() + tabbar('walk');
   const loading = state.geo === 'pending' || state.routesStatus === 'loading' || state.routesStatus === 'idle';
   const hasFav = state.favorites.length > 0;
   const tabs = hasFav ? `<div class="pad"><div class="segmented" role="tablist">
@@ -290,7 +401,7 @@ function screenHome(tab = 'nearby') {
       <div class="carousel" role="list" aria-label="Маршруты рядом" ${state.routesStatus === 'partial' ? 'aria-busy="true"' : ''}>${state.routes.map((r, i) => card(r, `#/route/${i}`, isFav(r))).join('')}${state.routesStatus === 'partial' ? '<div class="route-card skeleton" aria-hidden="true"></div>' : ''}</div>`;
   }
   return `${top}${ctrls}<section class="sheet with-tabbar" aria-labelledby="home-t">
-      <div class="row pad"><h1 class="h-sm grow" id="home-t">Маршруты для прогулки</h1><a class="icon-btn" href="#/settings" aria-label="Настройки подбора">${icon('sliders', 24)}</a></div>
+      <div class="row pad"><h1 class="h-sm grow" id="home-t">Маршруты для прогулки</h1><a class="icon-btn ghost" href="#/settings" aria-label="Настройки подбора">${icon('sliders', 24)}</a></div>
       ${tabs}${body}</section>${tabbar('walk')}`;
 }
 function card(r, href, fav) {
@@ -303,43 +414,123 @@ function card(r, href, fav) {
 const LOOP_SVG = '<svg width="132" height="64" viewBox="0 0 132 64" fill="none" aria-hidden="true"><path d="M26 40C26 22 46 11 66 13C86 15 100 7 110 19C120 31 107 45 90 47C72 49 60 59 42 55C32 53 26 48 26 40Z" stroke="currentColor" stroke-width="3" stroke-linecap="round"/><circle cx="26" cy="40" r="6" fill="var(--surface-card)" stroke="currentColor" stroke-width="3"/></svg>';
 const ONEWAY_SVG = '<svg width="132" height="64" viewBox="0 0 132 64" fill="none" aria-hidden="true"><path d="M18 50C38 50 40 22 62 24C84 26 86 46 104 42C114 40 118 30 118 18" stroke="currentColor" stroke-width="3" stroke-linecap="round"/><circle cx="18" cy="50" r="6" fill="var(--surface-card)" stroke="currentColor" stroke-width="3"/><circle cx="118" cy="16" r="7" fill="currentColor"/></svg>';
 
-function screenSettings() {
-  ui().className = '';
-  const d = state.draft || (state.draft = { ...state.settings });
+/* Goal controls: segmented time/steps, preset chips, custom slider. Shared by settings and onboarding. */
+const presetLabel = (isTime, v) => (isTime ? (v < 60 ? `${v} мин` : `${String(v / 60).replace('.', ',')} ч`) : nf.format(v));
+const customLabel = (isTime, v) => (isTime ? (v < 60 ? v + ' мин' : fmtGoalTime(v)) : nf.format(v) + ' шагов');
+const goalHint = d => { const km = goalKm(d); return d.goal === 'time' ? `Около ${fmtKm(km)} спокойным шагом` : `Около ${fmtKm(km)}, это примерно ${fmtDur(kmToMin(km))} спокойным шагом`; };
+function goalBlock(d) {
   const isTime = d.goal === 'time';
   const presets = isTime ? TIME_PRESETS : STEP_PRESETS;
   const val = isTime ? d.time : d.steps;
   const custom = isTime ? d.customTime : d.customSteps;
-  const label = v => (isTime ? (v < 60 ? `${v} мин` : fmtGoalTime(v)) : nf.format(v));
-  const km = goalKm(d);
-  const hint = isTime ? `Около ${fmtKm(km)} спокойным шагом` : `Около ${fmtKm(km)}, это примерно ${fmtDur(kmToMin(km))}`;
   const min = isTime ? 15 : 1000, max = isTime ? 180 : 30000, step = isTime ? 5 : 500;
-  return `<div style="position:fixed;inset:0;background:var(--scrim);z-index:-1" data-action="close-settings"></div>
-  <section class="sheet solo" role="dialog" aria-modal="true" aria-labelledby="set-t" style="gap:16px">
-    <div class="grabber"></div>
-    <div class="row pad"><h1 class="h-md grow" id="set-t">Настройки подбора</h1><button class="icon-btn" style="background:transparent" data-action="close-settings" aria-label="Закрыть">${icon('x', 24)}</button></div>
-    <div class="stack pad" style="gap:12px">
-      <h2 class="label-lg" style="margin:0">Продолжительность</h2>
-      <div class="segmented"><button data-goal="time" aria-pressed="${isTime}">${icon('clock', 16)}По времени</button><button data-goal="steps" aria-pressed="${!isTime}">${icon('footprints', 16)}По шагам</button></div>
+  return `<div class="segmented"><button data-goal="time" aria-pressed="${isTime}">${icon('clock', 20)}По времени</button><button data-goal="steps" aria-pressed="${!isTime}">${icon('footprints', 20)}По шагам</button></div>
       <div class="chips" role="group" aria-label="Варианты">
-        ${presets.map(v => `<button class="chip" data-preset="${v}" aria-pressed="${!custom && val === v}">${label(v)}</button>`).join('')}
+        ${presets.map(v => `<button class="chip" data-preset="${v}" aria-pressed="${!custom && val === v}">${presetLabel(isTime, v)}</button>`).join('')}
         <button class="chip" data-action="custom" aria-pressed="${custom}">Своё</button>
       </div>
-      ${custom ? `<div class="stack" style="gap:4px"><label class="h-md" for="rng" id="rng-v">${isTime ? (val < 60 ? val + ' мин' : fmtGoalTime(val)) : nf.format(val) + ' шагов'}</label>
+      <p class="caption muted" id="rng-hint" style="margin:0">${goalHint(d)}</p>
+      ${custom ? `<div class="stack" style="gap:8px"><label class="h-md" for="rng" id="rng-v">${customLabel(isTime, val)}</label>
         <input class="range" id="rng" type="range" min="${min}" max="${max}" step="${step}" value="${val}" aria-describedby="rng-hint">
-        <div class="range-row"><span>${isTime ? '15 мин' : '1 000'}</span><span>${isTime ? '3 ч' : '30 000'}</span></div></div>` : ''}
-      <p class="caption muted" id="rng-hint" style="margin:0">${hint}</p>
+        <div class="range-row"><span>${isTime ? '15 мин' : '1 000'}</span><span>${isTime ? '3 ч' : '30 000'}</span></div></div>` : ''}`;
+}
+function shapeBlock(d) {
+  return `<div class="shapes" role="radiogroup" aria-label="Форма маршрута">
+        <button class="shape" role="radio" data-shape="loop" aria-checked="${d.shape === 'loop'}"><span class="ill">${LOOP_SVG}</span><span class="tt">Замкнутый${d.shape === 'loop' ? icon('circleCheck', 20) : ''}</span><span class="dd">Вернётесь в точку старта</span></button>
+        <button class="shape" role="radio" data-shape="oneway" aria-checked="${d.shape === 'oneway'}"><span class="ill">${ONEWAY_SVG}</span><span class="tt">В одну сторону${d.shape === 'oneway' ? icon('circleCheck', 20) : ''}</span><span class="dd">Закончите в другом месте</span></button>
+      </div>`;
+}
+function screenSettings() {
+  ui().className = '';
+  const d = state.draft || (state.draft = { ...state.settings });
+  return `<div class="scrim" data-action="close-settings"></div>
+  <section class="sheet solo" role="dialog" aria-modal="true" aria-labelledby="set-t" style="gap:16px">
+    <div class="grabber"></div>
+    <div class="row pad"><h1 class="h-md grow" id="set-t">Настройки подбора</h1><button class="icon-btn ghost" data-action="close-settings" aria-label="Закрыть">${icon('x', 24)}</button></div>
+    <div class="stack pad" style="gap:12px">
+      <h2 class="label-lg" style="margin:0">Продолжительность</h2>
+      ${goalBlock(d)}
     </div>
     <div class="divider" role="separator"></div>
     <div class="stack pad" style="gap:12px">
       <h2 class="label-lg" style="margin:0">Форма маршрута</h2>
-      <div class="shapes" role="radiogroup" aria-label="Форма маршрута">
-        <button class="shape" role="radio" data-shape="loop" aria-checked="${d.shape === 'loop'}"><span class="ill">${LOOP_SVG}</span><span class="tt">Замкнутый${d.shape === 'loop' ? icon('circleCheck', 20) : ''}</span><span class="dd">Вернётесь в точку старта</span></button>
-        <button class="shape" role="radio" data-shape="oneway" aria-checked="${d.shape === 'oneway'}"><span class="ill">${ONEWAY_SVG}</span><span class="tt">В одну сторону${d.shape === 'oneway' ? icon('circleCheck', 20) : ''}</span><span class="dd">Закончите в другом месте</span></button>
-      </div>
+      ${shapeBlock(d)}
     </div>
     <div class="pad"><button class="btn primary block" data-action="apply">Показать маршруты</button></div>
   </section>`;
+}
+
+/* ---------------- wheel picker (Figma: WheelPicker / ParamPicker) ---------------- */
+const ROW = 44; // px per wheel row; CSS uses the same value
+function wheel({ id, label, unit, unitWord, min, max, value }) {
+  let items = '';
+  for (let v = min; v <= max; v++) items += `<div class="wheel-item" data-v="${v}"><span>${v}</span><span class="u">${unit}</span></div>`;
+  return `<div class="wheel-col"><div class="wheel" id="${id}" role="slider" tabindex="0" aria-label="${label}" aria-valuemin="${min}" aria-valuemax="${max}" aria-valuenow="${value}" aria-valuetext="${value} ${unitWord(value)}" data-min="${min}" data-value="${value}">${items}</div></div>`;
+}
+function paramPicker() {
+  const p = state.profile;
+  return `<div class="picker"><div class="picker-labels" aria-hidden="true"><span>Рост</span><span>Вес</span></div>
+    <div class="picker-wheels"><div class="picker-band" aria-hidden="true"></div>
+      ${wheel({ id: 'wh-h', label: 'Рост', unit: 'см', unitWord: n => plural(n, ['сантиметр', 'сантиметра', 'сантиметров']), ...HEIGHT, value: Number(p.height) || HEIGHT.def })}
+      ${wheel({ id: 'wh-w', label: 'Вес', unit: 'кг', unitWord: n => plural(n, ['килограмм', 'килограмма', 'килограммов']), ...WEIGHT, value: Number(p.weight) || WEIGHT.def })}
+    </div></div>`;
+}
+function bindWheels() {
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  for (const el of $$('.wheel')) {
+    const min = +el.dataset.min, max = +el.getAttribute('aria-valuemax');
+    const word = el.id === 'wh-h' ? n => plural(n, ['сантиметр', 'сантиметра', 'сантиметров']) : n => plural(n, ['килограмм', 'килограмма', 'килограммов']);
+    const items = [...el.children];
+    let idx = -1, t = 0;
+    const mark = () => {
+      const i = Math.max(0, Math.min(items.length - 1, Math.round(el.scrollTop / ROW)));
+      if (i === idx) return;
+      if (idx >= 0) for (let k = Math.max(0, idx - 2); k <= Math.min(items.length - 1, idx + 2); k++) items[k].className = 'wheel-item';
+      for (let k = Math.max(0, i - 2); k <= Math.min(items.length - 1, i + 2); k++) items[k].className = 'wheel-item d' + Math.abs(k - i);
+      if (idx >= 0 && navigator.vibrate) try { navigator.vibrate(4); } catch { }
+      idx = i;
+      const v = min + i; el.dataset.value = v;
+      el.setAttribute('aria-valuenow', v); el.setAttribute('aria-valuetext', `${v} ${word(v)}`);
+    };
+    const go = (v, smooth = !reduce) => el.scrollTo({ top: (Math.max(min, Math.min(max, v)) - min) * ROW, behavior: smooth ? 'smooth' : 'auto' });
+    el.addEventListener('scroll', () => { cancelAnimationFrame(t); t = requestAnimationFrame(mark); }, { passive: true });
+    el.addEventListener('click', e => { const it = e.target.closest('.wheel-item'); if (it) go(+it.dataset.v); });
+    el.addEventListener('keydown', e => {
+      const v = +el.dataset.value, step = { ArrowUp: -1, ArrowDown: 1, PageUp: -10, PageDown: 10 }[e.key];
+      if (step) { e.preventDefault(); go(v + step); }
+      else if (e.key === 'Home') { e.preventDefault(); go(min); } else if (e.key === 'End') { e.preventDefault(); go(max); }
+    });
+    go(+el.dataset.value, false); mark();
+  }
+}
+const pickedParams = () => ({ height: +$('#wh-h').dataset.value, weight: +$('#wh-w').dataset.value });
+
+/* ---------------- onboarding (Figma: Splashscreen → 5 steps) ---------------- */
+const ONB = 5;
+function screenOnboarding(n) {
+  n = Math.max(1, Math.min(ONB, n || 1));
+  ui().className = 'full onb';
+  const d = state.draft || (state.draft = { ...state.settings });
+  const head = `<header class="onb-head"><div class="onb-nav">${n > 1 ? `<a class="onb-back" href="#/onboarding/${n - 1}">${icon('chevronLeft', 16)}Назад</a>` : ''}<span class="onb-count" aria-label="Шаг ${n} из ${ONB}">${String(n).padStart(2, '0')} / ${String(ONB).padStart(2, '0')}</span></div>
+    <div class="onb-progress" aria-hidden="true">${Array.from({ length: ONB }, (_, i) => `<span class="${i < n ? 'on' : ''}"></span>`).join('')}</div></header>`;
+  const S = {
+    1: { ill: 'welcome', t: 'Привет, это Шагалка', p: 'Маршруты для прогулок рядом, под ваше время или количество шагов.', actions: `<a class="btn primary block" href="#/onboarding/2">Начать</a>` },
+    2: { ill: d.goal === 'time' ? 'time' : 'steps', t: 'Как подбирать маршрут?', p: 'Выберите время прогулки или цель по шагам. Способ можно поменять позже.', content: goalBlock(d), actions: `<button class="btn primary block" data-action="onb-next" data-n="3">Дальше</button>` },
+    3: { ill: 'shape', t: 'Какой маршрут удобнее?', p: 'Можно вернуться в точку старта или закончить прогулку в другом месте.', content: shapeBlock(d), actions: `<button class="btn primary block" data-action="onb-next" data-n="4">Дальше</button>` },
+    4: { ill: 'params', t: 'Уточним расчёты', p: 'Рост и вес помогут точнее считать шаги и калории. Можно пропустить — тогда расчёты будут примерными.', content: paramPicker(), actions: `<button class="btn primary block" data-action="onb-params">Дальше</button><a class="btn ghost sm block" href="#/onboarding/5">Пропустить</a>` },
+    5: { ill: 'geo', t: 'Нужна геопозиция', p: 'Разрешите доступ, чтобы находить прогулки рядом. Трек хранится только на телефоне.', actions: `<button class="btn primary block" data-action="onb-geo">Разрешить</button><button class="btn ghost sm block" data-action="onb-skip-geo">Пропустить</button>` },
+  }[n];
+  return `<div class="onb-page">${head}
+    <div class="onb-body"><img class="onb-ill${n === 4 ? ' sm' : ''}" src="img/onb-${S.ill}.webp" alt="" width="400" height="400">
+      <h1 class="h-lg" id="onb-t">${esc(S.t)}</h1><p>${esc(S.p)}</p></div>
+    <section class="onb-sheet" aria-labelledby="onb-t">${S.content ? `<div class="stack" style="gap:12px">${S.content}</div>` : ''}<div class="stack" style="gap:8px">${S.actions}</div></section></div>`;
+}
+function finishOnboarding(allowGeo) {
+  store.set('onboarded', true);
+  state.draft = null;
+  location.hash = '#/';
+  if (allowGeo) locate();
+  else { store.set('geoAsk', false); state.geo = 'skipped'; render(); }
 }
 
 function getRoute(kind, i) { return kind === 'fav' ? state.favorites[i] : state.routes[i]; }
@@ -361,7 +552,7 @@ function screenPreview(kind, i) {
       ${gallery.length ? `<div class="stack" style="gap:8px"><h2 class="label-lg pad" style="margin:0">Что увидите по пути</h2>
         <div class="gallery">${gallery.map(p => `<figure>${p.img ? `<img src="${esc(p.img)}" alt="${esc(p.name)}" loading="lazy">` : `<span class="ph" aria-hidden="true">${icon('mapPin', 24)}</span>`}<figcaption>${esc(p.name)}</figcaption></figure>`).join('')}</div></div>` : ''}
       <div class="tiles pad">${tile('clock', 'Время', fmtDurShort(kmToMin(r.km)))}${tile('footprints', 'Шаги', fmtSteps(kmToSteps(r.km)))}${tile('route', 'Путь', fmtKm(r.km))}</div>
-      <div class="pad"><button class="btn primary block" data-action="start" data-kind="${kind}" data-i="${i}">Начать прогулку</button></div>
+      <div class="pad"><button class="btn primary block" data-action="start" data-kind="${kind}" data-i="${i}">${icon('footprints', 20)}Начать прогулку</button></div>
     </section>`;
 }
 
@@ -394,19 +585,32 @@ function walkNumbers() { const w = state.walk, r = w.route; const left = Math.ma
 function updateWalkUI() {
   const w = state.walk; if (!w || !$('#w-timer')) return;
   const n = walkNumbers();
+  const s = walkS(w);
+  const mv = maneuverView(nextManeuver(w.route.geometry, s), w.route.shape);
+  if ($('#nav-dist')) {
+    $('#nav-dist').textContent = mv.dist;
+    if ($('#nav-text').textContent !== mv.text) $('#nav-text').textContent = mv.text; // live region: speak only when the manoeuvre changes
+    if ($('#nav-ic').dataset.ic !== mv.ic) { $('#nav-ic').dataset.ic = mv.ic; $('#nav-ic').innerHTML = icon(mv.ic, 32); }
+  }
   $('#w-timer').textContent = fmtClock(w.elapsed);
-  $('#w-left').textContent = `Осталось ${fmtKm(n.left)}, около ${fmtDur(kmToMin(n.left))}`;
+  $('#w-left').textContent = w.paused ? 'Прогулка на паузе' : `Осталось ${fmtKm(n.left)}, около ${fmtDur(kmToMin(n.left))}`;
   $('#w-bar').style.width = n.pct + '%';
   $('#w-goal').textContent = `${fmtSteps(n.steps)} из ${fmtSteps(n.goalSteps)} шагов, ${n.pct}% цели`;
   $('#w-km').textContent = fmtKm(w.km); $('#w-steps').textContent = fmtSteps(n.steps); $('#w-kcal').textContent = approx() + kcal(w.km);
-  drawRoute(w.route.geometry, w.route.shape, { fit: false, traveled: w.trace });
+  drawRoute(w.route.geometry, w.route.shape, { fit: false, traveled: w.trace, arrowsFrom: s });
 }
 function screenWalk() {
   const w = state.walk; if (!w) { location.hash = '#/'; return ''; }
   ui().className = '';
-  requestAnimationFrame(() => { drawRoute(w.route.geometry, w.route.shape, { bottom: 430, traveled: w.trace }); updateWalkUI(); });
+  requestAnimationFrame(() => { drawRoute(w.route.geometry, w.route.shape, { bottom: 430, traveled: w.trace, arrowsFrom: walkS(w) }); updateWalkUI(); });
   const n = walkNumbers();
-  return `<div class="topbar"><span class="badge ${w.paused ? 'warn' : 'ok'}" role="status"><span class="dot"></span>${w.paused ? 'На паузе' : 'Прогулка идёт'}${w.mode === 'demo' ? ' · демо ×' + DEMO_SPEEDUP : ''}</span></div>
+  const mv = maneuverView(nextManeuver(w.route.geometry, walkS(w)), w.route.shape);
+  // Walking: direction hint (NavHint). Paused: the address chip, as in Figma 08.
+  const top = w.paused
+    ? `<div class="topbar center"><div class="loc-chip">${icon('mapPin', 16)}<span>${esc(state.address || w.route.name)}</span></div></div>`
+    : `<div class="topbar"><div class="nav-hint"><span class="nav-ic" id="nav-ic" data-ic="${mv.ic}">${icon(mv.ic, 32)}</span>
+        <span class="grow stack" style="gap:2px"><span class="h-sm" id="nav-dist">${esc(mv.dist)}</span><span class="body-sm" id="nav-text" aria-live="polite">${esc(mv.text)}</span></span></div></div>`;
+  return `${top}
     <div class="spacer"></div>
     <div class="map-ctrls"><button class="icon-btn map" data-action="follow" aria-label="Показать меня на карте">${icon('locateFixed', 24)}</button></div>
     <section class="sheet solo" aria-label="Прогулка" style="gap:16px">
@@ -515,19 +719,47 @@ function screenDetails(id) {
 }
 
 /* ---------------- profile ---------------- */
-function screenProfile() {
+function screenProfile(withSheet = false) {
   ui().className = 'full';
-  return `<div class="page"><h1 class="h-lg">Профиль</h1>
-    <form class="card" id="pf" novalidate>
-      <h2 class="h-sm">Данные для расчёта</h2>
-      <div class="field"><label for="pf-w">Вес, кг</label><input id="pf-w" inputmode="decimal" type="number" min="30" max="250" placeholder="Например, 70" value="${esc(state.profile.weight)}" aria-describedby="pf-wh"><span class="hint" id="pf-wh">Нужен для калорий. Без веса считаем для 70 кг и ставим знак ≈.</span></div>
-      <div class="field"><label for="pf-s">Длина шага, см</label><input id="pf-s" inputmode="numeric" type="number" min="40" max="120" value="${esc(state.profile.stepCm)}" aria-describedby="pf-sh"><span class="hint" id="pf-sh">Обычно 65–80 см. Влияет на количество шагов.</span></div>
-      <button class="btn primary block" type="submit">Сохранить</button>
-    </form>
-    <div class="card"><h2 class="h-sm">Демо</h2><p class="body-sm muted" style="margin:0">Маршруты идут по реальным улицам и тропинкам. Места и пути — из OpenStreetMap, фото — из Википедии, если они там есть. На демо-районе прогулка идёт в ускоренном режиме ×${DEMO_SPEEDUP}.</p>
-      <button class="btn secondary block" data-action="seed">Добавить примеры в историю</button></div>
-    <button class="btn ghost block" style="color:var(--danger)" data-action="wipe">${icon('trash', 20)}Удалить все данные</button>
-  </div>${tabbar('profile')}`;
+  const p = state.profile;
+  const ptile = (label, v, unit) => `<button class="param-tile" data-action="edit-params" aria-label="${label}: ${v ? `${v} ${unit}` : 'не указан'}. Изменить">
+      <span class="grow stack" style="gap:2px"><span class="l">${label}</span><span class="v">${v ? `${v} ${unit}` : 'Не указан'}</span></span>${icon('chevronRight', 20)}</button>`;
+  const opts = MARKERS.map(m => `<button class="marker-opt" role="radio" aria-checked="${p.marker === m.id}" data-marker="${m.id}">
+      <span class="mk">${m.e ? `<span class="pet" aria-hidden="true">${m.e}</span>` : '<span class="dot"></span>'}</span><span>${m.name}</span></button>`).join('');
+  requestAnimationFrame(markerPreview);
+  return `<div class="page profile">
+    <h1 class="h-lg">Профиль</h1>
+    <section class="stack" style="gap:12px" aria-labelledby="pp-t">
+      <div class="stack" style="gap:4px"><h2 class="h-sm" id="pp-t">Рост и вес</h2><p class="body-sm secondary-text" style="margin:0">Нужны, чтобы точнее считать шаги и калории${p.weight ? '' : '. Пока считаем для 70 кг и ставим знак ≈'}</p></div>
+      <div class="param-tiles">${ptile('Рост', p.height, 'см')}${ptile('Вес', p.weight, 'кг')}</div>
+    </section>
+    <section class="stack" style="gap:12px" aria-labelledby="mk-t">
+      <div class="stack" style="gap:4px"><h2 class="h-sm" id="mk-t">Маркер на карте</h2><p class="body-sm secondary-text" style="margin:0">Так вы будете видеть себя на карте во время прогулки</p></div>
+      <div class="marker-preview" id="mkp" role="img" aria-label="Маркер «${esc(markerOf(p.marker).name)}» на карте"></div>
+      <div class="markers" role="radiogroup" aria-label="Маркер на карте">${opts}</div>
+    </section>
+    <section class="card" aria-labelledby="demo-t"><h2 class="label-lg" id="demo-t" style="margin:0">Для прототипа</h2><p class="body-sm muted" style="margin:0">Маршруты идут по реальным улицам: места и пути из OpenStreetMap, фото из Википедии. На демо-районе (?demo) прогулка ускорена ×${DEMO_SPEEDUP}.</p>
+      <button class="btn secondary block" data-action="seed">Добавить примеры в историю</button>
+      <button class="btn secondary block" data-action="restart-onb">Пройти знакомство заново</button>
+      <button class="btn ghost block" style="color:var(--danger)" data-action="wipe">${icon('trash', 20)}Удалить все данные</button></section>
+  </div>${tabbar('profile')}${withSheet ? paramsSheet() : ''}`;
+}
+function paramsSheet() {
+  return `<div class="scrim fixed" data-action="close-params"></div>
+  <section class="sheet solo overlay" role="dialog" aria-modal="true" aria-labelledby="ps-t" style="gap:16px">
+    <div class="grabber"></div>
+    <div class="row pad"><h2 class="h-sm grow" id="ps-t">Рост и вес</h2><button class="icon-btn ghost" data-action="close-params" aria-label="Закрыть">${icon('x', 24)}</button></div>
+    <div class="pad">${paramPicker()}</div>
+    <div class="pad"><button class="btn primary block" data-action="save-params">Сохранить</button></div></section>`;
+}
+let mkMap = null;
+function markerPreview() {
+  const el = $('#mkp'); if (!el) return;
+  if (mkMap) { mkMap.remove(); mkMap = null; }
+  const c = state.me || DEMO_CENTER;
+  mkMap = L.map(el, { zoomControl: false, attributionControl: false, dragging: false, scrollWheelZoom: false, doubleClickZoom: false, touchZoom: false, boxZoom: false, keyboard: false }).setView(c, 16);
+  themedTiles(mkMap);
+  L.marker(c, { icon: meIcon(), interactive: false, keyboard: false }).addTo(mkMap);
 }
 
 /* ---------------- router ---------------- */
@@ -535,9 +767,11 @@ function render() {
   const h = location.hash.replace(/^#\/?/, '');
   const [a, b] = h.split('/');
   $('#modal').innerHTML = '';
-  if (a !== 'settings') state.draft = null;
+  if (a !== 'settings' && a !== 'onboarding') state.draft = null;
+  if (a !== 'onboarding' && !store.get('onboarded', false)) { location.replace('#/onboarding/1'); return; }
   let html = '';
-  if (a === 'settings') html = screenSettings();
+  if (a === 'onboarding') html = screenOnboarding(+b);
+  else if (a === 'settings') html = screenSettings();
   else if (a === 'route') html = screenPreview('nearby', +b);
   else if (a === 'fav') html = screenPreview('fav', +b);
   else if (a === 'favorites') html = screenHome(state.favorites.length ? 'fav' : 'nearby');
@@ -545,7 +779,7 @@ function render() {
   else if (a === 'results') html = screenResults();
   else if (a === 'history' && b) html = screenDetails(b);
   else if (a === 'history') html = screenHistory();
-  else if (a === 'profile') html = screenProfile();
+  else if (a === 'profile') html = screenProfile(b === 'params');
   else html = state.walk ? (location.hash = '#/walk', '') : screenHome('nearby');
   if (html === '' && a !== '' && a !== undefined) return;
   const sameScreen = render.last === h, keepX = sameScreen ? ($('.carousel') || {}).scrollLeft : 0;
@@ -555,9 +789,10 @@ function render() {
   if (keepX) { const c = $('.carousel'); if (c) c.scrollLeft = keepX; } // re-render while routes arrive: keep the user's place
   if (sameScreen) $$('#ui > .sheet').forEach(s => (s.style.animation = 'none')); // no slide-in on a refresh of the same screen
   if (a === 'history' && !b) bindSwipe();
-  if (a === 'profile') bindProfile();
-  if (a === 'settings') bindSettings();
+  if (a === 'settings' || a === 'onboarding') bindSettings();
+  if ($('.wheel')) bindWheels();
   if (['settings', 'route', 'fav'].includes(a)) bindSheetDismiss();
+  if (a === 'profile' && b === 'params') $('#wh-h')?.focus({ preventScroll: true });
   if (!['route', 'fav', 'walk'].includes(a)) routeLayer && a !== 'walk' && routeLayer.clearLayers();
   setTimeout(() => map.invalidateSize(), 0);
 }
@@ -567,8 +802,8 @@ function bindSettings() {
   if (rng) rng.addEventListener('input', () => {
     const d = state.draft, v = +rng.value;
     if (d.goal === 'time') d.time = v; else d.steps = v;
-    $('#rng-v').textContent = d.goal === 'time' ? (v < 60 ? v + ' мин' : fmtGoalTime(v)) : nf.format(v) + ' шагов';
-    const km = goalKm(d); $('#rng-hint').textContent = d.goal === 'time' ? `Около ${fmtKm(km)} спокойным шагом` : `Около ${fmtKm(km)}, это примерно ${fmtDur(kmToMin(km))}`;
+    $('#rng-v').textContent = customLabel(d.goal === 'time', v);
+    $('#rng-hint').textContent = goalHint(d);
   });
 }
 /* Dismissable sheets: X button, system back gesture, and swipe down from the grabber area. */
@@ -608,26 +843,43 @@ function bindSheetDismiss() {
   sheet.addEventListener('pointercancel', end);
 }
 
-function bindProfile() {
-  $('#pf').addEventListener('submit', e => { e.preventDefault(); const w = $('#pf-w').value.trim(), s = $('#pf-s').value.trim();
-    if (w && (+w < 30 || +w > 250)) { toast('Вес должен быть от 30 до 250 кг'); $('#pf-w').focus(); return; }
-    if (s && (+s < 40 || +s > 120)) { toast('Длина шага — от 40 до 120 см'); $('#pf-s').focus(); return; }
-    const stepChanged = String(s || 75) !== String(state.profile.stepCm);
-    state.profile = { weight: w, stepCm: s || 75 }; save('profile');
-    if (stepChanged && state.settings.goal === 'steps' && state.me) loadRoutes(); // goal in steps → distance changed
-    toast('Сохранили'); });
+/** Save height and weight from the wheels. A new height changes step length → routes by steps change too. */
+function saveParams() {
+  const { height, weight: w } = pickedParams();
+  const stepChanged = height !== Number(state.profile.height);
+  state.profile = { ...state.profile, height, weight: w }; delete state.profile.stepCm; save('profile');
+  if (stepChanged && state.settings.goal === 'steps' && state.me) loadRoutes();
 }
 
 /* ---------------- actions ---------------- */
 document.addEventListener('click', async e => {
-  const el = e.target.closest('[data-action], [data-goal], [data-preset], [data-shape]'); if (!el) return;
+  const el = e.target.closest('[data-action], [data-goal], [data-preset], [data-shape], [data-marker]'); if (!el) return;
   const d = state.draft;
+  if (el.dataset.marker) {
+    state.profile.marker = el.dataset.marker; save('profile');
+    $$('.marker-opt').forEach(b => b.setAttribute('aria-checked', String(b === el)));
+    $('#mkp')?.setAttribute('aria-label', `Маркер «${markerOf(el.dataset.marker).name}» на карте`);
+    markerPreview(); setMe(state.me); return;
+  }
   if (el.dataset.goal) { d.goal = el.dataset.goal; render(); return; }
   if (el.dataset.preset) { const v = +el.dataset.preset; if (d.goal === 'time') { d.time = v; d.customTime = false; } else { d.steps = v; d.customSteps = false; } render(); return; }
   if (el.dataset.shape) { d.shape = el.dataset.shape; render(); return; }
   switch (el.dataset.action) {
-    case 'demo': useDemo(); location.hash = '#/'; break;
+    case 'demo': state.demo = true; locate(); location.hash = '#/'; break;
     case 'retry': locate(); break;
+    case 'geo-later': state.geo = 'off'; render(); break;
+    case 'pick': startPicking(); break;
+    case 'cancel-pick': state.picking = false; render(); break;
+    case 'onb-next': state.settings = { ...d }; save('settings'); location.hash = '#/onboarding/' + el.dataset.n; break;
+    case 'onb-params': saveParams(); location.hash = '#/onboarding/5'; break;
+    case 'onb-geo': finishOnboarding(true); break;
+    case 'onb-skip-geo': finishOnboarding(false); break;
+    case 'restart-onb': store.set('onboarded', false); location.hash = '#/onboarding/1'; break;
+    case 'edit-params': location.hash = '#/profile/params'; break;
+    case 'close-params': location.hash = '#/profile'; break;
+    case 'save-params': saveParams(); location.hash = '#/profile'; toast('Сохранили рост и вес'); break;
+    case 'reduce-goal': { const v = +el.dataset.v; state.settings = { ...state.settings, ...(state.settings.goal === 'time' ? { time: v, customTime: !TIME_PRESETS.includes(v) } : { steps: v, customSteps: !STEP_PRESETS.includes(v) }) }; save('settings'); loadRoutes(); break; }
+    case 'go-oneway': state.settings = { ...state.settings, shape: 'oneway' }; save('settings'); loadRoutes(); break;
     case 'recenter': if (state.me) map.setView(state.me, 16); break;
     case 'follow': { const w = state.walk; const p = w && (w.mode === 'demo' ? pointAt(w.route.geometry, w.km / w.route.km) : w.last); if (p) map.setView(p, 17); break; }
     case 'custom': if (d.goal === 'time') d.customTime = true; else d.customSteps = true; render(); break;
@@ -665,5 +917,15 @@ window.addEventListener('offline', render);
 initMap();
 if (new URLSearchParams(location.search).has('demo')) state.demo = true;
 render();
-locate({ quiet: true }); // геопозиция определяется сразу при входе
+/* Location at start: not during onboarding (its last step asks), and not if the user said "skip" there,
+   unless the browser already has permission. */
+(async () => {
+  if (!store.get('onboarded', false)) return;
+  if (state.demo || store.get('geoAsk', true)) { locate({ quiet: true }); return; }
+  let granted = false;
+  try { granted = (await navigator.permissions.query({ name: 'geolocation' })).state === 'granted'; } catch { }
+  if (granted) locate({ quiet: true }); else { state.geo = 'skipped'; render(); }
+})();
+/* Splash: shown by index.html before anything loads, removed once the first screen is drawn. */
+setTimeout(() => { const s = $('#splash'); if (!s) return; s.classList.add('out'); setTimeout(() => s.remove(), 300); }, 700);
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});

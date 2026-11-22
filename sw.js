@@ -1,5 +1,5 @@
 // Network-first for the app shell (so updates arrive right away), cache as offline fallback.
-const CACHE = 'shagalka-v2';
+const CACHE = 'shagalka-v3';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'routing.js', 'icons.js', 'manifest.webmanifest', 'icon-192.png'];
 
 self.addEventListener('install', e => {
